@@ -1,0 +1,22 @@
+{
+  "extends": "./cypress/tsconfig",
+  "include": ["src/**/*.ts", "*.ts", "./cypress/**/*.ts", "plugin.d.ts"],
+  "exclude": ["dist", "node_modules", "./cypress/e2e/**/*.ts"],
+  "compilerOptions": {
+    "types": ["cypress", "node"],
+    "target": "es5",
+    "module": "commonjs",
+    "allowJs": true,
+    "lib": ["DOM", "DOM.Iterable", "es5"],
+    "outDir": "dist",
+    "baseUrl": "./src",
+    "declaration": true,
+    "strict": false, // Bad idea, but needed for now
+    "forceConsistentCasingInFileNames": true /* Ensure that casing is correct in imports. */,
+    "strictNullChecks": false,
+    "moduleResolution": "node",
+    "downlevelIteration": true,
+    "esModuleInterop": true /* Enables emit interoperability between CommonJS and ES Modules via creation of namespace objects for all imports. Implies 'allowSyntheticDefaultImports'. */,
+    "allowSyntheticDefaultImports": true
+  }
+}
