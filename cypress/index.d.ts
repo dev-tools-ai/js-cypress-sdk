@@ -24,6 +24,7 @@ declare global {
        * @returns
        */
       findByAI(selector: string): Chainable<JQuery<HTMLElement> | null>;
+      task(command: 'readScreenshot', fileName: string): Chainable<string>;
     }
   }
 }

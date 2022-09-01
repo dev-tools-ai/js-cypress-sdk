@@ -27,6 +27,11 @@ export const getMultiplier = async (screenshotBase64: string) => {
   return 1.0 * (fileProperties.width / width);
 };
 
+/**
+ * Gets the dimensions of a png image
+ * @param imagePNGBase64
+ * @returns
+ */
 export const getPNGImageDimensions = async (imagePNGBase64: string) => {
   let fileData: promises.FileHandle | undefined;
   try {
@@ -44,6 +49,7 @@ export const getPNGImageDimensions = async (imagePNGBase64: string) => {
     } as imageDimensionsResults;
     return result;
   } catch (e) {
+    // eslint-disable-next-line no-console
     console.error('There was an issue reading the existing screenshot.', e);
     return null;
   } finally {
@@ -52,18 +58,40 @@ export const getPNGImageDimensions = async (imagePNGBase64: string) => {
   }
 };
 
-export async function getImageFileAsBase64(filePath: string) {
+export const getImageFileAsBase64 = async (filePath: string) => {
   const base64File = readFileSync(filePath, 'base64');
-
   return base64File || null;
-}
+};
 
 /**
  * Gets the screenshot uuid from a base64 encoded screenshot
  * @param b64Screenshot
  * @returns
  */
-export function getScreenshotHash(b64Screenshot: string) {
+export const getScreenshotHash = (b64Screenshot: string) => {
   const hashDigest = MD5(b64Screenshot).toString();
   return hashDigest;
-}
+};
+
+/**
+ * Returns the screenshot filepath after Cypress has taken. Cypress renames
+ * files depending on the amount of attempts so this is needed often.
+ *
+ * @usage const filepath = getScreenshotFilePath('testscreenshot')
+ * @param fileName
+ * @returns
+ */
+export const getScreenshotFilePath = (fileName: string) => {
+  // Cypress appends the attempt to the end of files,
+  // This throws off our attempts to read files.
+  // We will get the true screenshot name
+
+  // Remove the extension just in case
+  const parsedName = fileName.replace('.png', '');
+  // @ts-expect-error We are accessing the internal runner. Not in types
+  const attemptNumber = cy.state('runnable')._currentRetry + 1;
+  if (attemptNumber > 1) {
+    return `cypress/screenshots/${parsedName} (attempt ${attemptNumber}).png`;
+  }
+  return `cypress/screenshots/${parsedName}.png`;
+};

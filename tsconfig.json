@@ -1,9 +1,15 @@
 {
   "extends": "./cypress/tsconfig",
   "include": ["src/**/*.ts", "*.ts", "./cypress/**/*.ts", "plugin.d.ts"],
-  "exclude": ["dist", "node_modules", "./cypress/e2e/**/*.ts"],
+  "exclude": [
+    "dist",
+    "node_modules",
+    "./cypress/e2e/**/*.ts",
+    "./cypress/index.ts"
+  ],
   "compilerOptions": {
     "types": ["cypress", "node"],
+    "typeRoots": ["node_modules"],
     "target": "es5",
     "module": "commonjs",
     "allowJs": true,
