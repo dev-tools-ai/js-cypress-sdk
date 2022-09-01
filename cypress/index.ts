@@ -1,1 +1,0 @@
-import Cypress from 'cypress';
