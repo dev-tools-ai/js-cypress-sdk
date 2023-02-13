@@ -1,62 +1,41 @@
 /// <reference types="cypress"/>
-type overriddenCommands = 'get' | 'find';
-const currentCommandQueue: overriddenCommands[] = [];
-
-let manualDetectMode = false;
-let currentDetectLink = '';
-
 /* eslint-disable camelcase */
-import { createSDK } from '@devtools-ai/js-sdk';
-import type { DevToolsAiSDK, createSDKOptions } from '@devtools-ai/js-sdk';
+import type { testEntityModel } from '@devtools-ai/js-sdk';
 import {
-  getScreenshotHash,
   matchBoundingBoxToCypressElement,
   SmartDriverManager,
+  getSmartDriverClient,
+  createTestElementFromDOMRect,
+  getElementRectangle,
+  generateImageUUID,
 } from '../../src/utils';
 
-const SmartDriver = new SmartDriverManager();
+const currentCommandQueue: Array<'get' | 'find'> = [];
+const timerStack: NodeJS.Timer[] = [];
 
-function getSmartDriverClient() {
-  if (window.smartDriverClient) return cy.wrap(window.smartDriverClient);
-  return cy.task('getSDKConfig').then((config) => {
-    const client = createSDK({
-      ...(config as createSDKOptions),
-      screenMultiplier: window.devicePixelRatio,
-    });
-    window.smartDriverClient = client;
+const SCREENSHOT_FILE_NAME = 'temp';
 
-    return window.smartDriverClient;
-  });
-}
+const testManager = new SmartDriverManager();
+
+before(() => {
+  const testName = Cypress.currentTest.title;
+  // Before we run our tests, create a check in for analytics
+  // Mute Cypress logs to not spam the log with action
+
+  getSmartDriverClient().createCheckIn(testName);
+});
+
+after(() => {
+  // Clean up screenshots we have taken
+  cy.task('cleanupImages', null, { log: false });
+});
 
 /**
  * Return if the user wants to user interactive mode which
  * requires the user to manually classify the element.
  * @returns
  */
-function inInteractiveMode() {
-  return Cypress.env('interactiveMode') === true;
-}
-
-/**
- * Returns the true screenshot file name
- * @param fileName
- * @returns
- */
-function getScreenshotFilePath(fileName: string) {
-  // Cypress appends the attempt to the end of files,
-  // This throws off our attempts to read files.
-  // We will get the true screenshot name
-
-  // Remove the extension just in case
-  const parsedName = fileName.replace('.png', '');
-  // @ts-expect-error We are accessing the internal runner. Not in types
-  const attemptNumber = cy.state('runnable')._currentRetry + 1;
-  if (attemptNumber > 1) {
-    return `cypress/screenshots/${parsedName} (attempt ${attemptNumber}).png`;
-  }
-  return `cypress/screenshots/${parsedName}.png`;
-}
+const inInteractiveMode = () => Cypress.env('interactiveMode') === true;
 
 /**
  * Using the selector provided, tries to find an html element
@@ -68,107 +47,74 @@ function getScreenshotFilePath(fileName: string) {
  */
 function getByAI(selector: string) {
   const testName = Cypress.currentTest.title;
+  const client = getSmartDriverClient();
+  const screenshotFileName = generateImageUUID();
+  const eventId = (Math.random() + 1).toString(36).substring(2);
 
   // used only when we fail to get an element normally
-  return getSmartDriverClient().then((client) => {
-    cy.log('SmartDriver: Getting element by AI')
-      .then(() => {
-        // Get the screenshot
-        return cy
-          .screenshot('temp', { overwrite: true, capture: 'viewport' })
-          .readFile(getScreenshotFilePath('temp'), 'base64');
+  cy.then(() => {
+    let currentScreenshot = '';
+    return cy
+      .screenshot(screenshotFileName, {
+        overwrite: true,
+        capture: 'viewport',
       })
-      .then((screenshotBase64: string) => {
-        // Get the element Bounding Box
-        const b64Hash = getScreenshotHash(screenshotBase64);
-        SmartDriver.setTestScreenshot({
-          screenshotFileName: 'temp',
-          screenshotUuid: b64Hash,
+      .task('readScreenshot', screenshotFileName)
+      .then((screenshotBase64) => {
+        const b64Hash = testManager.setTestScreenshot(
+          screenshotFileName,
+          screenshotBase64,
+        );
+        currentScreenshot = screenshotBase64;
+        return client.getIfScreenshotExists(b64Hash, selector);
+      })
+      .then(({ screenshot_exists, predicted_element }) => {
+        if (screenshot_exists) return predicted_element;
+        return new Cypress.Promise<null>(async (resolve) => {
+          try {
+            await client.uploadTestElementScreenshot(
+              currentScreenshot,
+              selector,
+              testName,
+            );
+            resolve(null);
+          } catch (e) {
+            resolve(null);
+          }
         });
-        return client
-          .getIfScreenshotExists(b64Hash, selector)
-          .then(({ screenshot_exists, predicted_element }) => {
-            if (screenshot_exists) {
-              if (!predicted_element) {
-                return null;
-              }
-              return predicted_element;
-            } else {
-              // screenshot does not exist
-              // upload it and try again
-              return client
-                .uploadTestElementScreenshot(
-                  screenshotBase64,
-                  selector,
-                  testName,
-                )
-                .then(({ screenshot_uuid }) => {
-                  return client.getTestCaseBox(
-                    selector,
-                    screenshot_uuid,
-                    false,
-                  );
-                })
-                .then(({ predicted_element }) => {
-                  return predicted_element;
-                });
+      })
+      .then((possibleEl) => {
+        const predicted_element = possibleEl;
+        if (!predicted_element) {
+          const { screenshotUuid } =
+            testManager.getTestCaseScreenshotInformation(screenshotFileName);
+          return new Cypress.Promise<{
+            predicted_element: testEntityModel | null;
+          }>(async (resolve) => {
+            const { predicted_element, success } = await client.getTestCaseBox(
+              selector,
+              screenshotUuid,
+              testName,
+              false,
+              eventId,
+            );
+            if (!predicted_element || !success) {
+              resolve({ predicted_element: null });
             }
+            resolve({ predicted_element });
           });
-      })
-      .then((elementBox) => {
-        // Return the jquery element
-        if (!elementBox) {
-          // Attempt the escape hatch to try to using manual
-          // classification
-          return cy.findByAI(selector);
         }
-        return matchBoundingBoxToCypressElement(elementBox);
-      });
-  }) as unknown as Cypress.Chainable<JQuery<HTMLElement> | null>;
-}
-
-const createTestElementFromDOMRect = (rect: DOMRect) => ({
-  x: rect.left,
-  y: rect.top,
-  width: rect.right - rect.left,
-  height: rect.bottom - rect.top,
-});
-
-const getElementRectangle = (el: JQuery<HTMLElement>) => {
-  return el[0].getBoundingClientRect() || null;
-};
-
-const resetDetectMode = () => {
-  currentDetectLink = '';
-  manualDetectMode = false;
-};
-
-const getIfElementHasModel = (selector: string, screenshotUuid: string) => {
-  return getSmartDriverClient().then((client) => {
-    return client
-      .getTestCaseBox(selector, screenshotUuid)
-      .then((res) => {
-        const { predicted_element } = res;
-        return predicted_element;
+        return { predicted_element };
       })
-      .then((elemBox) => {
-        return elemBox ? true : false;
+      .then((element) => {
+        const { predicted_element } = element as unknown as {
+          predicted_element: testEntityModel;
+        } | null;
+        if (!predicted_element) return findByAI(selector);
+        return matchBoundingBoxToCypressElement(predicted_element);
       });
   });
-};
-
-let originalFn = null;
-const muteCypressLogs = () => {
-  originalFn = Cypress.log;
-  // @ts-expect-error this is temporary to mute polling info
-  // eslint-disable-next-line @typescript-eslint/no-empty-function
-  Cypress.log = () => {};
-};
-const reenableCypressLogs = () => {
-  if (originalFn) {
-    Cypress.log = originalFn;
-  }
-};
+}
 
 /**
  * Call the 'detect' API and checks if there is a model for it
@@ -179,266 +125,236 @@ const reenableCypressLogs = () => {
  */
 const findByAI = (selector: string) => {
   const testName = Cypress.currentTest.title;
+  const eventId = (Math.random() + 1).toString(36).substring(2);
   // If we have the model, look for the closest match
   // If there is no match, cypress will automatically
   // fail the test.
+
   const errorMessage =
     'Boundary box was never received. Please visit https://smartdriver.dev-tools.ai/ to classify your element';
+
   // Time length is in ms, minutes * seconds * ms
   const timeoutLength = 100 * 60 * 1000; // 100 minutes
+
   const getSecondsElapsed = (start: number) => {
     return Date.now() - start;
   };
-  getSmartDriverClient().then((client) => {
-    cy.then({ timeout: timeoutLength }, () => {
-      const startTime = Date.now();
-      if (manualDetectMode && inInteractiveMode()) {
-        cy.task('openClassifyTab', currentDetectLink)
-          .then(() => {
-            const { screenshotUuid } =
-              SmartDriver.getTestCaseScreenshotInformation();
-            return getIfElementHasModel(selector, screenshotUuid);
-          })
-          .then({ timeout: timeoutLength }, (hasModel) => {
-            let elementClassified = false;
-            if (hasModel) {
-              return null;
-            }
+  const client = getSmartDriverClient();
+  const screenshotFileName = generateImageUUID();
 
-            return new Cypress.Promise((resolve, reject) => {
-              // every second, check
-              muteCypressLogs();
-              const timeoutWithBuffer = timeoutLength * 0.95;
-
-              const timerId = setInterval(async () => {
-                const { screenshotUuid } =
-                  SmartDriver.getTestCaseScreenshotInformation();
-                const { predicted_element } =
-                  await window.smartDriverClient.getTestCaseBox(
-                    selector,
-                    screenshotUuid,
-                  );
-                if (predicted_element) {
-                  elementClassified = true;
-                  clearInterval(timerId);
-                  return resolve();
-                }
-                const currentTime = getSecondsElapsed(startTime);
-                if (currentTime > timeoutWithBuffer) {
-                  clearInterval(timerId);
-                  return reject(new Error(errorMessage));
-                }
-              }, 1000);
-
-              (function pollBoundaryBox() {
-                if (elementClassified) return resolve();
-                const currentTime = getSecondsElapsed(startTime);
-                const timeoutWithBuffer = timeoutLength * 0.45;
-                if (currentTime > timeoutWithBuffer) {
-                  clearInterval(timerId);
-                  return reject(new Error(errorMessage));
-                }
-                setTimeout(pollBoundaryBox, timeoutLength);
-              })();
-            });
-          })
-          .then(() => {
-            reenableCypressLogs();
-            resetDetectMode();
-          });
-      }
-    });
-
-    cy.screenshot('temp', { overwrite: true, capture: 'viewport' })
-      .readFile(getScreenshotFilePath('temp'), 'base64')
-      .then((b64screenshot) => {
-        const b64hash = getScreenshotHash(b64screenshot);
-        SmartDriver.setTestScreenshot({
-          screenshotFileName: 'temp',
-          screenshotUuid: b64hash,
+  if (inInteractiveMode()) {
+    cy.screenshot(screenshotFileName, {
+      overwrite: true,
+      capture: 'viewport',
+    })
+      .task('readScreenshot', screenshotFileName)
+      .then({ timeout: timeoutLength }, (b64screenshot) => {
+        return new Cypress.Promise<string>(async (resolve, _) => {
+          await client.uploadTestElementScreenshot(
+            b64screenshot,
+            selector,
+            testName,
+          );
+          // in interactive mode we upload with interactive: true which guarantees we will have the screenshot
+          resolve(b64screenshot);
         });
-        cy.log('SmartDriver: Retrieving element 🔧');
-        return client.classifyObject(b64screenshot, '', selector, testName);
       })
-      .then(({ predicted_element }) => {
-        const elementFound =
-          matchBoundingBoxToCypressElement(predicted_element);
-        if (!elementFound) {
-          throw new Error('SmartDriver: No element found for ' + selector);
-        }
-        return elementFound;
-      });
-  });
-};
-
-const handleUploadingScreenshot = (
-  screenshot_exists: boolean,
-  client: DevToolsAiSDK,
-  selector: string,
-  testName: string,
-  b64hash: string,
-  element: JQuery<HTMLElement>,
-  b64screenshot: string,
-) => {
-  if (screenshot_exists) {
-    return cy
-      .log('SmartDriver: Screenshot exists, skipping upload ' + b64hash)
-      .then(() => {
-        const elementRectangle = getElementRectangle(element);
-        const elementBox = createTestElementFromDOMRect(elementRectangle);
-        return client.updateTestElement(
-          elementBox,
-          b64hash,
-          selector,
-          testName,
-          false,
+      .then({ timeout: timeoutLength }, (b64screenshot) => {
+        // Save our screenshot data
+        // Then try to get the element box
+        const screenshotUuid = testManager.setTestScreenshot(
+          screenshotFileName,
+          b64screenshot,
         );
-      });
-  } else {
-    return cy
-      .log('SmartDriver: Screenshot does not exist. Uploading 🚚')
-      .then(() => {
-        const elementRectangle = getElementRectangle(element);
-        const elementBox = createTestElementFromDOMRect(elementRectangle);
-        return client
-          .uploadTestElementScreenshot(b64screenshot, selector, testName)
-          .then(({ screenshot_uuid }) => {
-            return client.updateTestElement(
-              elementBox,
-              screenshot_uuid,
+        cy.log('SmartDriver: Retrieving element 🔧');
+        return new Cypress.Promise<Cypress.Chainable<
+          JQuery<HTMLElement>
+        > | null>(async (resolve, reject) => {
+          // try to get the element box first
+          try {
+            const { predicted_element } = await client.getTestCaseBox(
               selector,
+              screenshotUuid,
               testName,
               false,
+              eventId,
             );
-          });
-      });
-  }
-};
+            if (!predicted_element) {
+              resolve(null);
+            }
+            resolve(matchBoundingBoxToCypressElement(predicted_element));
+          } catch (error) {
+            // No box found, we can resolve this for now
+            reject(error);
+          }
+        });
+      })
+      .then({ timeout: timeoutLength }, (elementFound) => {
+        if (!elementFound) {
+          // There is no boundary box yet, wait for user to draw it in
+          // wait for user to draw in element
+          const labelUrl = encodeURI(
+            `https://smartdriver.dev-tools.ai/testcase/label?test_case_name=${Cypress.currentTest.title}`,
+          );
+          cy.task('openClassifyTab', labelUrl)
+            .then({ timeout: timeoutLength }, () => {
+              const startTime = Date.now();
+              let elementClassified = false;
+              return new Cypress.Promise<
+                Cypress.Chainable<JQuery<HTMLElement>>
+              >((resolve, reject) => {
+                // wait for the element to be classified
 
-const devToolsGet = (selector: string) => {
-  const testName = Cypress.currentTest.title;
-  getSmartDriverClient().then((client) => {
-    let elementFound: JQuery<HTMLElement> | undefined;
+                const timeoutWithBuffer = timeoutLength * 0.95;
+                const timerId = setInterval(async () => {
+                  try {
+                    const { screenshotUuid } =
+                      testManager.getTestCaseScreenshotInformation(
+                        screenshotFileName,
+                      );
+                    const { predicted_element } =
+                      await window.smartDriverClient.getTestCaseBox(
+                        selector,
+                        screenshotUuid,
+                        testName,
+                        false,
+                        eventId,
+                      );
+                    if (predicted_element) {
+                      elementClassified = true;
+                      clearInterval(timerId);
+                      return resolve(
+                        matchBoundingBoxToCypressElement(predicted_element),
+                      );
+                    }
+                    const currentTime = getSecondsElapsed(startTime);
+                    if (currentTime > timeoutWithBuffer) {
+                      clearInterval(timerId);
+                      return reject(new Error(errorMessage));
+                    }
+                  } catch (e) {
+                    clearInterval(timerId);
 
-    cy.then(() => {
-      cy.log('SmartDriver: Element not found, attempting using AI.');
-      cy.getByAI(selector).then((element) => {
-        elementFound = element;
-      });
-    });
+                    throw e;
+                  }
+                }, 2000);
+                timerStack.push(timerId);
+                (function pollBoundaryBox() {
+                  // continue polling until user enters the
+                  // bounding box
+                  if (elementClassified) {
+                    return resolve();
+                  }
 
-    cy.then(() => {
-      return client.getIfFrozen(selector).then((res) => {
-        const { is_frozen } = res;
-        if (!is_frozen) {
-          cy.log('Element not frozen, uploading');
-          return cy
-            .screenshot('temp', { overwrite: true, capture: 'viewport' })
-            .readFile(getScreenshotFilePath('temp'), 'base64')
-            .then((b64screenshot) => {
-              const b64hash = getScreenshotHash(b64screenshot);
-              // We need to return here to
-              // actually resolve this and move to the next
-              // step.
-              // Save the screenshot details
-              SmartDriver.setTestScreenshot({
-                screenshotFileName: 'temp',
-                screenshotUuid: b64hash,
+                  const currentTime = getSecondsElapsed(startTime);
+                  const timeoutWithBuffer = timeoutLength * 0.45;
+                  if (currentTime > timeoutWithBuffer) {
+                    clearInterval(timerId);
+                    return reject(new Error(errorMessage));
+                  }
+                  setTimeout(pollBoundaryBox, timeoutLength);
+                })();
               });
-              return client
-                .getIfScreenshotExists(b64hash, selector)
-                .then((res) => {
-                  const { screenshot_exists } = res;
-                  return handleUploadingScreenshot(
-                    screenshot_exists,
-                    client,
-                    selector,
-                    testName,
-                    b64hash,
-                    elementFound,
-                    b64screenshot,
-                  );
-                })
-                .then(() => {
-                  return elementFound;
-                });
+            })
+            .then((elem) => {
+              return elem;
             });
         } else {
-          cy.log('SmartDriver: Element is frozen, skipping upload.');
+          // Element boundary box was successfully grabbed
+          // return to be used
           return elementFound;
         }
       });
-    });
-  });
+  } else {
+    let currentScreenshot = '';
+    cy.screenshot(screenshotFileName, { overwrite: true })
+      .task('readScreenshot', screenshotFileName)
+      .then((b64screenshot) => {
+        currentScreenshot = b64screenshot;
+        const b64Hash = testManager.setTestScreenshot(
+          screenshotFileName,
+          b64screenshot,
+        );
+        return client.getIfScreenshotExists(b64Hash, selector);
+      })
+      .then(({ success, predicted_element }) => {
+        if (success && predicted_element) {
+          return matchBoundingBoxToCypressElement(predicted_element);
+        } else {
+          return new Cypress.Promise(async (resolve, reject) => {
+            try {
+              const { success, message, predicted_element } =
+                await client.classifyObject(
+                  currentScreenshot,
+                  '',
+                  selector,
+                  testName,
+                );
+
+              if (!success) {
+                reject(message);
+              }
+              resolve(matchBoundingBoxToCypressElement(predicted_element));
+            } catch (e) {
+              reject(e);
+            }
+          });
+        }
+      });
+  }
 };
 
 Cypress.Commands.add('findByAI', findByAI);
 Cypress.Commands.add('getByAI', getByAI);
+
 Cypress.on('test:before:run', () => {
   // Reset our run
   currentCommandQueue.splice(0, currentCommandQueue.length);
 });
+
 Cypress.on('fail', (err) => {
-  const { message } = err;
+  // Just in case a promise fails, reenable this
 
-  const lastCommand = currentCommandQueue.pop();
+  testManager.createFailState();
+  const { name } = err;
+  timerStack.forEach((val) => clearInterval(val));
 
-  if (lastCommand === 'get' || lastCommand === 'find') {
-    SmartDriver.setIsInBackupMode(true);
-  }
-  if (
-    message.includes('no model found - Please visit') &&
-    inInteractiveMode()
-  ) {
-    // we did this. we are good.
-    const linkStart = message.indexOf('https://');
-    const linkEnd = message.indexOf(' ', linkStart);
-    manualDetectMode = true;
-    currentDetectLink = message.substring(linkStart, linkEnd);
+  if (name === 'AxiosError') {
+    // eslint-disable-next-line no-console
+    console.error(err);
   }
 
   throw err;
 });
+/*
+* DISABLING OVERWRITE COMMANDS DUE TO ISSUE IN CYPRESS 12
+*   - https://github.com/cypress-io/cypress/issues/25078
+*
 
-Cypress.Commands.overwrite('find', (originalFn, _, findSelector) => {
-  currentCommandQueue.push('find');
-  //@ts-expect-error findSelector is mapped to the wrong type
-  SmartDriver.cacheSelector(findSelector);
-  //@ts-expect-error findSelector is mapped to the wrong type
-  if (SmartDriver.getShouldUseAI(findSelector)) {
-    //@ts-expect-error this is actually the string given into the find function
-    return devToolsGet(findSelector);
-  }
-  if (SmartDriver.getIsInBackupMode()) {
-    SmartDriver.resetCurrentMode();
-    //@ts-expect-error see above
-    SmartDriver.updateSelector(findSelector, true);
+Cypress.Commands.overwrite(
+  'find',
+  (originalFn, previousElement, findSelector) => {
+    currentCommandQueue.push('find');
+    //@ts-expect-error findSelector is mapped to the wrong type
+    testManager.addCommandToStack(findSelector, 'find');
+    //@ts-expect-error findSelector is mapped to the wrong type
+    testManager.cacheSelector(findSelector);
+    if (
+      testManager.getIsInBackupMode() ||
+      //@ts-expect-error this is actually the string given into the find function
+      testManager.getShouldUseAI(findSelector)
+    ) {
+      testManager.resetCurrentMode();
+      //@ts-expect-error this is actually the string given into the find function
 
-    //@ts-expect-error see above
-    return devToolsGet(findSelector);
-  }
-  return originalFn(_);
-});
+      return findByAI(findSelector);
+    }
+
+    return originalFn(previousElement, findSelector);
+  },
+);
 
 Cypress.Commands.overwrite('get', (originalFn, selector: string, options) => {
-  currentCommandQueue.push('get');
-
-  if (SmartDriver.getShouldUseAI(selector)) {
-    return devToolsGet(selector);
-  }
-  if (SmartDriver.getIsInBackupMode()) {
-    // reset being in backup mode
-    SmartDriver.updateSelector(selector, true);
-
-    SmartDriver.resetCurrentMode();
-    return devToolsGet(selector);
-  }
-
-  // If the element is found as normal,
-  // upload the screenshot if it isn't frozen,
-  // add the model found,
-  // return the element
-
   const testName = Cypress.currentTest.title;
 
   if (selector.includes(':cy-')) {
@@ -446,82 +362,71 @@ Cypress.Commands.overwrite('get', (originalFn, selector: string, options) => {
     return originalFn(selector, options);
   }
 
+  testManager.addCommandToStack(selector, 'get');
+  if (testManager.getIsInBackupMode() || testManager.getShouldUseAI(selector)) {
+    testManager.resetCurrentMode();
+    return findByAI(selector);
+  }
+
+  // If the element is found as normal,
+  // upload the screenshot if it isn't frozen,
+  // add the model found,
+  // return the element
+
   const getWithAutoIngest = (selector, options) => {
-    getSmartDriverClient().then((client) => {
-      cy.then(() => {
-        return client.getIfFrozen(selector).then((response) => {
-          const { is_frozen } = response;
-          if (is_frozen) {
-            cy.log('SmartDriver: Element is frozen, skipping upload.');
-            return originalFn(selector, options);
-          } else {
-            cy.log('Element not frozen, uploading');
-            return cy
-              .screenshot('temp', { overwrite: true, capture: 'viewport' })
-              .readFile(getScreenshotFilePath('temp'), 'base64')
-              .then((b64screenshot) => {
-                const b64hash = getScreenshotHash(b64screenshot);
-                SmartDriver.setTestScreenshot({
-                  screenshotFileName: 'temp',
-                  screenshotUuid: b64hash,
-                });
-                return client
-                  .getIfScreenshotExists(b64hash, selector)
-                  .then((res) => {
-                    const { screenshot_exists } = res;
-                    if (screenshot_exists) {
-                      cy.log(
-                        'SmartDriver: Screenshot exists already, skipping upload',
-                      );
-                      const screenshot_uuid = b64hash;
-                      originalFn(selector)
-                        .then(getElementRectangle)
-                        .then((rect) => {
-                          const element = createTestElementFromDOMRect(rect);
-                          client.updateTestElement(
-                            element,
-                            screenshot_uuid,
-                            selector,
-                            testName,
-                            false,
-                          );
-                        });
-                    } else {
-                      cy.log(
-                        'SmartDriver: Screenshot does not exist. Uploading 🚚',
-                      );
-                      return client
-                        .uploadTestElementScreenshot(
-                          b64screenshot,
-                          selector,
-                          testName,
-                        )
-                        .then((res) => {
-                          const { screenshot_uuid } = res;
-                          originalFn(selector)
-                            .then(getElementRectangle)
-                            .then((rect) => {
-                              const element =
-                                createTestElementFromDOMRect(rect);
-                              client.updateTestElement(
-                                element,
-                                screenshot_uuid,
-                                selector,
-                                testName,
-                                false,
-                              );
-                            });
-                        });
-                    }
-                  })
-                  .then(() => {
-                    return originalFn(selector, options);
-                  });
-              });
-          }
+    const client = getSmartDriverClient();
+    let currentScreenshot = '';
+    const screenshotFileName = generateImageUUID();
+
+    cy.then(() => {
+      return client.getIfFrozen(selector);
+    }).then(({ is_frozen }) => {
+      if (is_frozen) return originalFn(selector, options);
+      return cy
+        .screenshot(SCREENSHOT_FILE_NAME, {
+          overwrite: true,
+          capture: 'viewport',
+        })
+        .task('readScreenshot', screenshotFileName)
+        .then((b64screenshot) => {
+          currentScreenshot = b64screenshot;
+          const screeenshothash = testManager.setTestScreenshot(
+            SCREENSHOT_FILE_NAME,
+            b64screenshot,
+          );
+          return client.getIfScreenshotExists(screeenshothash, selector);
+        })
+        .then(({ screenshot_exists }) => {
+          return screenshot_exists
+            ? null
+            : client.uploadTestElementScreenshot(
+                currentScreenshot,
+                selector,
+                testName,
+              );
+        })
+        .then(() => {
+          return originalFn(selector, options);
+        })
+        .then((el) => {
+          return getElementRectangle(el as JQuery<HTMLElement>);
+        })
+        .then((rect) => {
+          const element = createTestElementFromDOMRect(rect);
+          const { screenshotUuid } =
+            testManager.getTestCaseScreenshotInformation(SCREENSHOT_FILE_NAME);
+          return client.updateTestElement(
+            element,
+            screenshotUuid,
+            selector,
+            testName,
+          );
+        })
+        .then(() => {
+          return originalFn(selector, options);
         });
-      });
     });
   };
   return getWithAutoIngest(selector, options);
 });
+*/

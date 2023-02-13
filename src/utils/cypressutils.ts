@@ -1,3 +1,4 @@
+import { getScreenshotHash } from './imageUtils';
 import { zip } from './sortUtils';
 
 export type elementBoundaryBox = {
@@ -9,13 +10,16 @@ export type elementBoundaryBox = {
   element?: HTMLElement;
 };
 
-export function iouBoxes(box1: elementBoundaryBox, box2: elementBoundaryBox) {
+export const iouBoxes = (
+  box1: elementBoundaryBox,
+  box2: elementBoundaryBox,
+) => {
   return iou(box1, box2);
-}
+};
 
-export function matchBoundingBoxToCypressElement(
+export const matchBoundingBoxToCypressElement = (
   boundingBox: elementBoundaryBox,
-) {
+) => {
   const pixelRatio = window.devicePixelRatio;
   const newBoundaryBox = {
     x: boundingBox['x'] / pixelRatio,
@@ -50,29 +54,33 @@ export function matchBoundingBoxToCypressElement(
         cy.log('SmartDriver Error: No element found');
         return null;
       }
-      for (const [_, currWebElement] of composite) {
+      const maxScore = composite[0][0];
+      for (const [score, currWebElement] of composite) {
         const { tagName, element } = currWebElement;
-        if (tagName === 'input' || tagName === 'button') {
+        if (
+          (tagName === 'input' || tagName === 'button') &&
+          score >= maxScore * 0.5
+        ) {
           return element;
         }
       }
       return composite[0][1].element;
     });
-}
+};
 
-export function iou(
+export const iou = (
   elementBox: elementBoundaryBox,
   targetBox: elementBoundaryBox,
-) {
+) => {
   return (
     areaOverlap(elementBox, targetBox) /
     (area(elementBox.width, elementBox.height) +
       area(targetBox.width, targetBox.height) -
       areaOverlap(elementBox, targetBox))
   );
-}
+};
 
-export function getBoundaryBoxFromCypressElement(element: Element) {
+export const getBoundaryBoxFromCypressElement = (element: Element) => {
   const elementTagName = element.tagName;
 
   const { x, y, right, left, top, bottom } = element.getBoundingClientRect();
@@ -84,12 +92,12 @@ export function getBoundaryBoxFromCypressElement(element: Element) {
     tagName: elementTagName,
     element: element,
   } as elementBoundaryBox;
-}
+};
 
-function areaOverlap(
+const areaOverlap = (
   elementBox: elementBoundaryBox,
   targetBox: elementBoundaryBox,
-) {
+) => {
   const { x: x1, y: y1, width: w1, height: h1 } = elementBox;
   const { x: x2, y: y2, width: w2, height: h2 } = targetBox;
   const dx = Math.min(x1 + w1, x2 + w2) - Math.max(x1, x2);
@@ -98,13 +106,16 @@ function areaOverlap(
     return dx * dy;
   }
   return 0;
-}
+};
 
-export function area(x: number, y: number) {
+export const area = (x: number, y: number) => {
   return x * y;
-}
+};
 
-export function centerHit(box1: elementBoundaryBox, box2: elementBoundaryBox) {
+export const centerHit = (
+  box1: elementBoundaryBox,
+  box2: elementBoundaryBox,
+) => {
   const { x: x1, y: y1, width: w1, height: h1 } = box1;
 
   const box1Center = {
@@ -120,7 +131,7 @@ export function centerHit(box1: elementBoundaryBox, box2: elementBoundaryBox) {
     return true;
   }
   return false;
-}
+};
 
 type testScreenshot = {
   screenshotUuid: string;
@@ -130,44 +141,137 @@ type testCaseDetails = {
   screenshot?: testScreenshot;
 };
 
+export const createTestElementFromDOMRect = (rect: DOMRect) => ({
+  x: rect.left,
+  y: rect.top,
+  width: rect.right - rect.left,
+  height: rect.bottom - rect.top,
+});
+
+export const getElementRectangle = (el: JQuery<HTMLElement>) => {
+  return el[0].getBoundingClientRect() || null;
+};
+
 export class SmartDriverManager {
-  selectorCache = new Map<string, boolean>();
-  isInBackupMode = false;
-  testCaseInformation: testCaseDetails = { screenshot: undefined };
+  _selectorCache: Map<string, boolean>;
+  _isInBackupMode = false;
+  _testCasesScreenshots: Map<string, string>;
+  _commandStack: Map<number, { selector: string; command: string } | undefined>;
+  _testCaseInformation: testCaseDetails;
+
+  constructor() {
+    this._selectorCache = new Map<string, boolean>();
+    this._testCasesScreenshots = new Map<string, string>();
+    this._commandStack = new Map<
+      number,
+      { selector: string; command: string } | undefined
+    >();
+    this._testCaseInformation = { screenshot: undefined };
+  }
+
+  /**
+   * Returns if we are working in a retry mode
+   * @returns
+   */
   getIsInBackupMode() {
-    return this.isInBackupMode;
+    return this._isInBackupMode;
   }
 
+  /**
+   * Reset the current mode for the test.
+   */
   resetCurrentMode() {
-    this.isInBackupMode = false;
+    this._isInBackupMode = false;
   }
 
-  setTestScreenshot(updatedScreenshotInfo: testScreenshot) {
-    this.testCaseInformation = {
-      ...this.testCaseInformation,
-      screenshot: { ...updatedScreenshotInfo },
+  /**
+   * Saves the screenshot's unique hash using the screenshot data.
+   * Note: It does not save the original screenshot data
+   * @param {string} fileName
+   * @param {string} screenshotb64
+   * @returns {string} Screenshot hash
+   */
+  setTestScreenshot(fileName: string, screenshot64: string) {
+    const b64Hash = getScreenshotHash(screenshot64);
+    this._testCasesScreenshots.set(fileName, b64Hash);
+    return b64Hash;
+  }
+
+  getTestCaseScreenshotInformation(fileName: string) {
+    const hash = this._testCasesScreenshots.get(fileName);
+    return {
+      screenshotUuid: hash,
+      screenshotFileName: fileName,
     };
   }
 
-  getTestCaseScreenshotInformation() {
-    return this.testCaseInformation.screenshot;
+  createFailState() {
+    // called whenever cypress fails a test
+    // the last command in our queue might be have failed to grab an
+    // element
+    if (!this._commandStack.size) return;
+    this._isInBackupMode = true;
+    const lastCommand = this._commandStack.get(this._commandStack.size);
+
+    if (!lastCommand) return;
+    const { selector } = lastCommand;
+    this._selectorCache.set(selector, true);
   }
 
-  setIsInBackupMode(useBackupMode: boolean) {
-    this.isInBackupMode = useBackupMode;
+  addCommandToStack(selector: string, command: 'get' | 'find') {
+    const nextIndex = this._commandStack.size + 1;
+    this._commandStack.set(nextIndex, {
+      selector,
+      command,
+    });
   }
 
   getShouldUseAI(selector: string) {
-    return this.selectorCache.get(selector);
+    return this._selectorCache.get(selector);
   }
 
   cacheSelector(selector: string) {
-    if (!this.selectorCache.has(selector)) {
-      this.selectorCache.set(selector, false);
+    if (!this._selectorCache.has(selector)) {
+      this._selectorCache.set(selector, false);
     }
   }
 
   updateSelector(selector: string, useAI: boolean) {
-    this.selectorCache.set(selector, useAI);
+    this._selectorCache.set(selector, useAI);
   }
 }
+
+let _originalLogFn = null;
+/**
+ * Mutes the logging done by Cypress. Particularly useful when polling
+ * or making repeated network calls and spamming the log is desireable.
+ */
+export const muteCypressLogs = () => {
+  _originalLogFn = Cypress.log;
+  if (Cypress.version >= '10.0.0') {
+    // @ts-expect-error this is temporary to mute polling info
+    // eslint-disable-next-line @typescript-eslint/no-empty-function
+    Cypress.log = () => {};
+  }
+};
+
+/**
+ * Reenables the ability to log items in Cypress
+ */
+export const reenableCypressLogs = () => {
+  if (_originalLogFn) {
+    Cypress.log = _originalLogFn;
+  }
+};
+
+export const generateImageUUID = () => {
+  const pattern = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx';
+  return (
+    'temp-devtools-' +
+    pattern.replace(/[xy]/g, (c) => {
+      const r = (Math.random() * 16) | 0;
+      const v = c === 'x' ? r : (r & 0x3) | 0x8;
+      return v.toString(16);
+    })
+  );
+};
